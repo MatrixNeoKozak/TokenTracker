@@ -10367,6 +10367,145 @@ test("parseOmpIncremental backfills project usage from the session header cwd", 
   }
 });
 
+test("parseOmpIncremental keeps the totals cursor at the last terminated record so a completed tail is counted", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tt-omp-partial-"));
+  try {
+    const sessionsDir = path.join(tmp, "sessions", "--test--");
+    await fs.mkdir(sessionsDir, { recursive: true });
+    const filePath = path.join(sessionsDir, "session.jsonl");
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const cursors = { version: 1, files: {}, updatedAt: null };
+
+    const ts1 = Date.UTC(2026, 3, 5, 14, 0, 0);
+    const ts2 = Date.UTC(2026, 3, 5, 14, 35, 0);
+    const header = buildOmpSessionHeader();
+    const complete = buildOmpAssistantLine({
+      id: "msg-complete-1",
+      model: "claude-sonnet-4-5",
+      input: 100,
+      output: 20,
+      timestamp: ts1,
+      totalTokens: 120,
+    });
+    const tail = buildOmpAssistantLine({
+      id: "msg-partial-2",
+      model: "claude-sonnet-4-5",
+      input: 50,
+      output: 10,
+      timestamp: ts2,
+      totalTokens: 60,
+    });
+    // Simulate a writer interrupted mid-record: no trailing newline.
+    const cut = Math.floor(tail.length / 2);
+    await fs.writeFile(filePath, [header, complete, tail.slice(0, cut)].join("\n"), "utf8");
+
+    const first = await parseOmpIncremental({ sessionFiles: [filePath], cursors, queuePath });
+    assert.equal(first.eventsAggregated, 1, "only the terminated record counts");
+    assert.equal(
+      cursors.omp.fileOffsets[filePath].size,
+      Buffer.byteLength([header, complete].join("\n") + "\n", "utf8"),
+      "cursor stops at the last terminated record, not at EOF",
+    );
+
+    await fs.appendFile(filePath, tail.slice(cut) + "\n", "utf8");
+    const second = await parseOmpIncremental({ sessionFiles: [filePath], cursors, queuePath });
+    assert.equal(second.eventsAggregated, 1, "the completed tail is counted exactly once");
+
+    const queued = await readJsonLines(queuePath);
+    assert.equal(queued.length, 2);
+    assert.equal(queued.at(-1).total_tokens, 60);
+
+    const third = await parseOmpIncremental({ sessionFiles: [filePath], cursors, queuePath });
+    assert.equal(third.eventsAggregated, 0, "an unchanged file queues nothing");
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("parseOmpIncremental skips an oversized non-usage record and keeps scanning past it", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tt-omp-oversized-"));
+  try {
+    const projectDir = path.join(tmp, "workspace", "project");
+    const sessionsDir = path.join(tmp, "sessions", "--project--");
+    await fs.mkdir(path.join(projectDir, ".git"), { recursive: true });
+    await fs.mkdir(sessionsDir, { recursive: true });
+    await fs.writeFile(
+      path.join(projectDir, ".git", "config"),
+      '[remote "origin"]\n\turl = https://github.com/example/omp-oversized.git\n',
+      "utf8",
+    );
+
+    const filePath = path.join(sessionsDir, "session.jsonl");
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const projectQueuePath = path.join(tmp, "project.queue.jsonl");
+    const cursors = { version: 1, files: {}, updatedAt: null };
+    const ts = Date.UTC(2026, 3, 5, 14, 10, 0);
+
+    // 8 MiB * 8 plus framing is just above the 64 MiB per-record cap, like the
+    // real 679 MB eval output from issue #789 but cheap enough for CI.
+    await fs.writeFile(filePath, buildOmpSessionHeader({ cwd: projectDir }) + "\n", "utf8");
+    await fs.appendFile(
+      filePath,
+      '{"type":"message","id":"big00001","message":{"role":"toolResult","toolName":"eval","content":[{"type":"text","text":"',
+      "utf8",
+    );
+    const chunk = Buffer.alloc(8 * 1024 * 1024, 0x61);
+    for (let i = 0; i < 8; i += 1) await fs.appendFile(filePath, chunk);
+    await fs.appendFile(filePath, '"}]}}\n', "utf8");
+    await fs.appendFile(
+      filePath,
+      buildOmpAssistantLine({
+        id: "use00001",
+        model: "claude-sonnet-4-5",
+        input: 100,
+        output: 20,
+        timestamp: ts,
+        totalTokens: 120,
+      }) + "\n",
+      "utf8",
+    );
+
+    const fileSize = (await fs.stat(filePath)).size;
+    const first = await parseOmpIncremental({
+      sessionFiles: [filePath],
+      cursors,
+      queuePath,
+      projectQueuePath,
+    });
+    assert.equal(first.eventsAggregated, 1, "usage after the oversized record is counted");
+    assert.equal(first.projectBucketsQueued, 1);
+    assert.equal(
+      cursors.omp.fileOffsets[filePath].size,
+      fileSize,
+      "totals cursor advances past the terminated oversized record",
+    );
+    assert.equal(
+      cursors.omp.projectFileOffsets[filePath].size,
+      fileSize,
+      "project cursor advances past the terminated oversized record",
+    );
+
+    const queued = await readJsonLines(queuePath);
+    assert.equal(queued.length, 1);
+    assert.equal(queued[0].total_tokens, 120);
+    assert.equal(queued[0].hour_start, "2026-04-05T14:00:00.000Z");
+    const projectRows = await readJsonLines(projectQueuePath);
+    assert.equal(projectRows.length, 1);
+    assert.equal(projectRows[0].project_ref, "https://github.com/example/omp-oversized");
+
+    const second = await parseOmpIncremental({
+      sessionFiles: [filePath],
+      cursors,
+      queuePath,
+      projectQueuePath,
+    });
+    assert.equal(second.eventsAggregated, 0, "the oversized record is not reread");
+    assert.equal(second.projectBucketsQueued, 0);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
 // ─── pi (@mariozechner/pi-coding-agent) tests — same on-disk format as omp ───
 
 test("parsePiIncremental preserves the legacy 'pi' source when provider is missing", async () => {

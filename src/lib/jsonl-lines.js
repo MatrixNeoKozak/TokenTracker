@@ -5,6 +5,12 @@
  * only LF as a record separator so valid U+2028/U+2029 characters inside JSON
  * strings remain part of the record. Reading raw bytes keeps byte budgets exact
  * and lets malformed UTF-8 fail closed.
+ *
+ * `maxPhysicalBytes` caps one physical record, not the stream: a transcript may
+ * hold any number of small records, while a single oversized one is either
+ * rejected (`oversized: "throw"`, the default) or skipped without ever being
+ * buffered or decoded (`oversized: "skip"`). A skipped record still reports its
+ * exact `physicalBytes` so callers can resume at the following boundary.
  */
 class PhysicalJsonlLimitError extends Error {
   constructor(maxPhysicalBytes) {
@@ -26,16 +32,28 @@ function decodePhysicalLine(buffer, { stripCr = false } = {}) {
 async function* physicalJsonlRecords(input, {
   invalidUtf8 = "throw",
   maxPhysicalBytes = Infinity,
+  oversized = "throw",
 } = {}) {
   if (invalidUtf8 !== "throw" && invalidUtf8 !== "record") {
     throw new TypeError(`unsupported invalidUtf8 policy: ${invalidUtf8}`);
+  }
+  if (oversized !== "throw" && oversized !== "skip") {
+    throw new TypeError(`unsupported oversized policy: ${oversized}`);
   }
   const byteLimit = Number.isFinite(maxPhysicalBytes)
     ? Math.max(0, Number(maxPhysicalBytes))
     : Infinity;
   const fragments = [];
   let fragmentsBytes = 0;
-  let physicalBytesRead = 0;
+  // Once a record exceeds the limit its bytes are still counted, but no longer
+  // buffered, so skipping one costs O(1) memory instead of its own size.
+  let oversizedRecord = false;
+
+  function resetRecord() {
+    fragments.length = 0;
+    fragmentsBytes = 0;
+    oversizedRecord = false;
+  }
 
   for await (const value of input) {
     if (!Buffer.isBuffer(value) && !(value instanceof Uint8Array)) {
@@ -50,15 +68,18 @@ async function* physicalJsonlRecords(input, {
     while (newline !== -1) {
       const fragment = chunk.subarray(start, newline);
       const physicalBytes = fragmentsBytes + fragment.length + 1;
-      if (physicalBytesRead + physicalBytes > byteLimit) {
-        throw new PhysicalJsonlLimitError(byteLimit);
+      if (oversizedRecord || physicalBytes > byteLimit) {
+        if (oversized === "throw") throw new PhysicalJsonlLimitError(byteLimit);
+        resetRecord();
+        yield { line: null, utf8Valid: false, oversized: true, physicalBytes, terminated: true };
+        start = newline + 1;
+        newline = chunk.indexOf(0x0a, start);
+        continue;
       }
       const lineBuffer = fragments.length === 0
         ? fragment
         : Buffer.concat([...fragments, fragment], fragmentsBytes + fragment.length);
-      fragments.length = 0;
-      fragmentsBytes = 0;
-      physicalBytesRead += physicalBytes;
+      resetRecord();
       start = newline + 1;
       newline = chunk.indexOf(0x0a, start);
       let line;
@@ -74,15 +95,28 @@ async function* physicalJsonlRecords(input, {
 
     if (start < chunk.length) {
       const fragment = chunk.subarray(start);
-      if (physicalBytesRead + fragmentsBytes + fragment.length > byteLimit) {
-        throw new PhysicalJsonlLimitError(byteLimit);
+      if (oversizedRecord) {
+        fragmentsBytes += fragment.length;
+      } else if (fragmentsBytes + fragment.length > byteLimit) {
+        if (oversized === "throw") throw new PhysicalJsonlLimitError(byteLimit);
+        oversizedRecord = true;
+        fragments.length = 0;
+        fragmentsBytes += fragment.length;
+      } else {
+        fragments.push(Buffer.from(fragment));
+        fragmentsBytes += fragment.length;
       }
-      fragments.push(Buffer.from(fragment));
-      fragmentsBytes += fragment.length;
     }
   }
 
   if (fragmentsBytes > 0) {
+    if (oversizedRecord) {
+      // The terminator is still missing, so its length (and therefore the next
+      // record's start) is unknown; report the span read so far and let the
+      // caller decide whether to stop or retry once the record is completed.
+      yield { line: null, utf8Valid: false, oversized: true, physicalBytes: fragmentsBytes, terminated: false };
+      return;
+    }
     const lineBuffer = fragments.length === 1
       ? fragments[0]
       : Buffer.concat(fragments, fragmentsBytes);

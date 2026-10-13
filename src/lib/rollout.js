@@ -10550,7 +10550,7 @@ async function parseCodebuddyIncremental({
     let postStat = stat;
     try { postStat = fssync.statSync(filePath); } catch {}
     fileOffsets[filePath] = {
-      size: Math.max(postStat.size, committedEndOffset),
+      size: postStat.size,
       mtimeMs: postStat.mtimeMs,
       ino: postStat.ino,
     };
@@ -15709,6 +15709,14 @@ function ompEntryTimestampMs(msg, entry) {
   return null;
 }
 
+// A single transcript record above this size is never decoded. Real oh-my-pi
+// evaluation outputs have reached 679 MB (issue #789); readline materialises a
+// line before any filter can run, which blows past V8's maximum string length
+// and kills the sync child with an uncatchable RangeError. The byte-level
+// reader reports the record's span instead, so the scan resumes at its
+// terminator without the record ever becoming a string.
+const OMP_MAX_PHYSICAL_RECORD_BYTES = 64 * 1024 * 1024;
+
 // Shared implementation for the oh-my-pi session format. omp and omo both
 // persist it verbatim, so they differ only in where the sessions live, which
 // cursor namespace they own, and how reasoning tokens are spelled.
@@ -15817,9 +15825,16 @@ async function parseOmpLikeIncremental({
     let scannedEndOffset = startOffset;
     let committedEndOffset = startOffset;
 
-    for await (const record of physicalJsonlRecords(stream, { invalidUtf8: "record", maxPhysicalBytes: 64 * 1024 * 1024 })) {
+    for await (const record of physicalJsonlRecords(stream, {
+      invalidUtf8: "record",
+      maxPhysicalBytes: OMP_MAX_PHYSICAL_RECORD_BYTES,
+      oversized: "skip",
+    })) {
       scannedEndOffset += record.physicalBytes;
       if (record.terminated) committedEndOffset = scannedEndOffset;
+      // Above the cap: skipped undecoded, its terminator still advances the
+      // cursor so the next sync does not reread it.
+      if (record.oversized) continue;
       if (!record.utf8Valid) {
         if (!record.terminated) break;
         continue;
@@ -15929,7 +15944,10 @@ async function parseOmpLikeIncremental({
     let postStat = stat;
     try { postStat = fssync.statSync(filePath); } catch {}
     fileOffsets[filePath] = {
-      size: postStat.size,
+      // Resume at the last terminated record: a trailing partial record must be
+      // re-read once a later sync completes it (entry ids keep that idempotent),
+      // otherwise the completion's bytes are silently dropped.
+      size: committedEndOffset,
       mtimeMs: postStat.mtimeMs,
       ino: postStat.ino,
     };
@@ -15964,6 +15982,10 @@ async function parseOmpLikeIncremental({
         : null;
       const projectRef = projectContext?.projectRef || null;
       const projectKey = projectContext?.projectKey || null;
+      // Null while the attribution scan does not run: a file with no resolvable
+      // project is never attributed, so its cursor still advances to EOF rather
+      // than being rescanned on every sync.
+      let committedEndOffset = null;
 
       if (projectKey && projectRef) {
         let stream;
@@ -15975,10 +15997,17 @@ async function parseOmpLikeIncremental({
           continue;
         }
         let scannedEndOffset = startOffset;
-        let committedEndOffset = startOffset;
-        for await (const record of physicalJsonlRecords(stream, { invalidUtf8: "record", maxPhysicalBytes: 64 * 1024 * 1024 })) {
+        committedEndOffset = startOffset;
+        for await (const record of physicalJsonlRecords(stream, {
+          invalidUtf8: "record",
+          maxPhysicalBytes: OMP_MAX_PHYSICAL_RECORD_BYTES,
+          oversized: "skip",
+        })) {
           scannedEndOffset += record.physicalBytes;
           if (record.terminated) committedEndOffset = scannedEndOffset;
+          // Above the cap: skipped undecoded, its terminator still advances the
+          // cursor so the next sync does not reread it.
+          if (record.oversized) continue;
           if (!record.utf8Valid) {
             if (!record.terminated) break;
             continue;
@@ -16062,7 +16091,9 @@ async function parseOmpLikeIncremental({
       let postStat = stat;
       try { postStat = fssync.statSync(filePath); } catch {}
       projectFileOffsets[filePath] = {
-        size: Math.max(postStat.size, committedEndOffset),
+        // Same resume rule as the totals cursor when the file was attributed;
+        // unattributed files keep advancing to EOF.
+        size: committedEndOffset ?? postStat.size,
         mtimeMs: postStat.mtimeMs,
         ino: postStat.ino,
       };
