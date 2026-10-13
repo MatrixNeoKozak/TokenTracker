@@ -10550,7 +10550,7 @@ async function parseCodebuddyIncremental({
     let postStat = stat;
     try { postStat = fssync.statSync(filePath); } catch {}
     fileOffsets[filePath] = {
-      size: postStat.size,
+      size: Math.max(postStat.size, committedEndOffset),
       mtimeMs: postStat.mtimeMs,
       ino: postStat.ino,
     };
@@ -15810,16 +15810,37 @@ async function parseOmpLikeIncremental({
     let stream;
     try {
       stream = fssync.createReadStream(filePath, {
-        encoding: "utf8",
         start: startOffset,
       });
     } catch { continue; }
-    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
 
-    for await (const line of rl) {
-      if (!line || !line.trim()) continue;
+    let scannedEndOffset = startOffset;
+    let committedEndOffset = startOffset;
+
+    for await (const record of physicalJsonlRecords(stream, { invalidUtf8: "record", maxPhysicalBytes: 64 * 1024 * 1024 })) {
+      scannedEndOffset += record.physicalBytes;
+      if (record.terminated) committedEndOffset = scannedEndOffset;
+      if (!record.utf8Valid) {
+        if (!record.terminated) break;
+        continue;
+      }
+
+      const line = record.line;
+      if (!line || !line.trim()) {
+        if (record.terminated) committedEndOffset = scannedEndOffset;
+        continue;
+      }
+      if (!line.includes('"message"') || !line.includes('"assistant"')) {
+        if (record.terminated) committedEndOffset = scannedEndOffset;
+        continue;
+      }
+
       let entry;
-      try { entry = JSON.parse(line); } catch { continue; }
+      try { entry = JSON.parse(line); } catch {
+        if (record.terminated) committedEndOffset = scannedEndOffset;
+        continue;
+      }
+      if (record.terminated) committedEndOffset = scannedEndOffset;
 
       // First line of each file is type:"session" (header) — skip all
       // non-message records.
@@ -15948,17 +15969,37 @@ async function parseOmpLikeIncremental({
         let stream;
         try {
           stream = fssync.createReadStream(filePath, {
-            encoding: "utf8",
             start: startOffset,
           });
         } catch {
           continue;
         }
-        const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-        for await (const line of rl) {
-          if (!line || !line.trim()) continue;
+        let scannedEndOffset = startOffset;
+        let committedEndOffset = startOffset;
+        for await (const record of physicalJsonlRecords(stream, { invalidUtf8: "record", maxPhysicalBytes: 64 * 1024 * 1024 })) {
+          scannedEndOffset += record.physicalBytes;
+          if (record.terminated) committedEndOffset = scannedEndOffset;
+          if (!record.utf8Valid) {
+            if (!record.terminated) break;
+            continue;
+          }
+
+          const line = record.line;
+          if (!line || !line.trim()) {
+            if (record.terminated) committedEndOffset = scannedEndOffset;
+            continue;
+          }
+          if (!line.includes('"message"') || !line.includes('"assistant"')) {
+            if (record.terminated) committedEndOffset = scannedEndOffset;
+            continue;
+          }
+
           let entry;
-          try { entry = JSON.parse(line); } catch { continue; }
+          try { entry = JSON.parse(line); } catch {
+            if (record.terminated) committedEndOffset = scannedEndOffset;
+            continue;
+          }
+          if (record.terminated) committedEndOffset = scannedEndOffset;
           const msg = entry?.type === "message" ? entry.message : null;
           const usage = msg?.role === "assistant" ? msg.usage : null;
           if (!usage || typeof usage !== "object") continue;
@@ -16021,7 +16062,7 @@ async function parseOmpLikeIncremental({
       let postStat = stat;
       try { postStat = fssync.statSync(filePath); } catch {}
       projectFileOffsets[filePath] = {
-        size: postStat.size,
+        size: Math.max(postStat.size, committedEndOffset),
         mtimeMs: postStat.mtimeMs,
         ino: postStat.ino,
       };
